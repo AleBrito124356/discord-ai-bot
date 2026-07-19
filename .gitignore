@@ -1,0 +1,32 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data: SQLite DB, WAL files and per-guild RAG vector stores
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+logs/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

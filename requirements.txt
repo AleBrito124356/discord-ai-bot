@@ -1,0 +1,7 @@
+# Core runtime dependencies. Pin minimum versions known to work together.
+discord.py>=2.4.0        # Discord gateway + app_commands (slash commands)
+openai>=1.30.0           # OpenAI-compatible client, points at the NIM endpoint
+aiosqlite>=0.20.0        # async SQLite for config, memory and usage counters
+numpy>=1.26.0            # in-process vector store for RAG
+python-dotenv>=1.0.0     # load .env in development
+pypdf>=4.2.0             # extract text from PDF attachments during /docs ingest
