@@ -70,36 +70,53 @@ def split_message(text: str, limit: int = 1900) -> List[str]:
 
 @dataclass
 class Transcript:
-    """A transcript trimmed to a character budget, newest messages kept."""
+    """A transcript trimmed to a character budget.
+
+    ``keep`` says which end survived: ``"newest"`` (the default, used by
+    /summarize) or ``"oldest"`` (used when summarizing *from* a message).
+    """
 
     text: str
     included: int
     total: int
+    keep: str = "newest"
 
     @property
     def truncated(self) -> bool:
         return self.included < self.total
 
-    def header(self, noun: str = "messages") -> str:
+    def header(self, noun: str = "messages", anchor: Optional[str] = None) -> str:
+        if anchor is not None:
+            if self.truncated:
+                return (
+                    f"**Summary of the first {self.included} of {self.total} {noun} "
+                    f"from {anchor}** (later ones did not fit)"
+                )
+            return f"**Summary of {self.total} {noun} from {anchor}**"
         if self.truncated:
+            which, dropped = ("last", "older") if self.keep == "newest" else ("first", "later")
             return (
-                f"**Summary of the last {self.included} of {self.total} {noun}** "
-                "(older ones did not fit)"
+                f"**Summary of the {which} {self.included} of {self.total} {noun}** "
+                f"({dropped} ones did not fit)"
             )
         return f"**Summary of the last {self.total} {noun}**"
 
 
-def build_transcript(lines: Sequence[str], budget: int) -> Transcript:
-    """Keep the NEWEST lines (given oldest-first) whose total fits ``budget``.
+def build_transcript(lines: Sequence[str], budget: int, keep: str = "newest") -> Transcript:
+    """Join ``lines`` (given oldest-first) within ``budget`` characters.
 
-    Summaries are about what is happening now, so when the transcript is too
-    long the oldest lines are dropped, never the most recent ones. A single
-    line longer than the budget is cut to fit so the newest message is never
-    lost entirely.
+    With ``keep="newest"`` the NEWEST lines are kept: summaries are about what
+    is happening now, so when the transcript is too long the oldest lines are
+    dropped, never the most recent ones. ``keep="oldest"`` keeps the start
+    instead. A single line longer than the budget is cut to fit, so the line
+    that must survive is never lost entirely.
     """
+    if keep not in ("newest", "oldest"):
+        raise ValueError("keep must be 'newest' or 'oldest'")
+    ordered = list(reversed(lines)) if keep == "newest" else list(lines)
     kept: List[str] = []
     used = 0
-    for line in reversed(lines):
+    for line in ordered:
         cost = len(line) + (1 if kept else 0)
         if used + cost > budget:
             if not kept and budget > 0:
@@ -107,5 +124,6 @@ def build_transcript(lines: Sequence[str], budget: int) -> Transcript:
             break
         kept.append(line)
         used += cost
-    kept.reverse()
-    return Transcript(text="\n".join(kept), included=len(kept), total=len(lines))
+    if keep == "newest":
+        kept.reverse()
+    return Transcript(text="\n".join(kept), included=len(kept), total=len(lines), keep=keep)

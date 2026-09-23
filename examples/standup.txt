@@ -1,0 +1,12 @@
+Ana: morning all, quick standup before the release
+Luis: I finished the embedding benchmark, nv-embedqa-e5-v5 is 2x faster than our old model
+Ana: nice. so do we switch the docs index to it?
+Marta: yes, but switching means everyone has to re-run /docs ingest
+Luis: lol
+Ana: ok, we decided to ship v2 on Friday with the new embedding model
+Marta: open question: do we migrate the database before or after the freeze?
+Luis: I think after, the migration is in-place anyway
+Ana: +1
+Marta: Ana owns the changelog, I will update the setup guide by Thursday
+Luis: I'll write the migration test tomorrow
+Ana: great, thanks everyone

@@ -32,6 +32,8 @@ def isolated_env(monkeypatch, tmp_path):
     for name in BOT_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    # load_env_file() must never pick up a developer's real <repo>/.env.
+    monkeypatch.setenv("BOT_ENV_FILE", str(tmp_path / "no-such.env"))
     yield
 
 

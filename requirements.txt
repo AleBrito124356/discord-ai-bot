@@ -5,3 +5,4 @@ aiosqlite>=0.20.0        # async SQLite for config, memory and usage counters
 numpy>=1.26.0            # in-process vector store for RAG
 python-dotenv>=1.0.0     # load .env in development
 pypdf>=4.2.0             # extract text from PDF attachments during /docs ingest
+Pillow>=10.3.0           # convert/downscale images for the vision model (bot/imaging.py)

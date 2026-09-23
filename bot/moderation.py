@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Pattern, Sequence
 
 from .nim_client import NimError
+from .prompts import MODERATION_SYSTEM_PROMPT
 
 log = logging.getLogger("moderation")
 
@@ -71,17 +72,7 @@ CATEGORIES = (
     "none",
 )
 
-SYSTEM_PROMPT = (
-    "You are a moderation assistant. You do not take any action; you only "
-    "advise human moderators. Judge whether a single chat message likely "
-    "breaks common community rules (harassment, hate, threats, sexual "
-    "content involving minors, scams/phishing, spam, or doxxing). "
-    "Respond with ONLY a compact JSON object and nothing else, of the form: "
-    '{"flag": true|false, "category": "harassment|hate|threat|nsfw|scam|'
-    'spam|doxxing|other|none", "severity": 0.0-1.0, "rationale": "one short '
-    'sentence"}. Be conservative: normal disagreement, profanity used '
-    "casually, or edgy jokes are usually not violations."
-)
+SYSTEM_PROMPT = MODERATION_SYSTEM_PROMPT
 
 
 @dataclass

@@ -43,6 +43,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .prompts import RAG_SYSTEM_PROMPT
+
 log = logging.getLogger("rag")
 
 STORE_FORMAT = 2
@@ -51,14 +53,6 @@ NO_INDEX_TEXT = (
     "No documents have been ingested yet. An admin can run `/docs ingest` after "
     "setting a docs channel with `/config docs-channel`."
 )
-
-RAG_SYSTEM_PROMPT = (
-    "You answer questions strictly from the provided context excerpts. "
-    "Cite the sources you use with bracketed numbers like [1] that match "
-    "the excerpt numbers. If the answer is not in the context, say you "
-    "could not find it in the server's documents. Do not invent citations."
-)
-
 
 class RagIndexError(RuntimeError):
     """The stored index can not be used as-is. The message is user-safe."""
@@ -96,6 +90,7 @@ class RagAnswer:
     sources: List[Tuple[int, Chunk]]
     hits: List[Tuple[Chunk, float]]
     found: bool
+    indexed: bool = True  # False when the guild has no docs index at all
 
     def formatted(self) -> str:
         """The answer followed by a Sources footer listing only cited excerpts."""
@@ -140,10 +135,20 @@ def chunk_text(text: str, size: int, overlap: int) -> List[str]:
             if i == 0:
                 stitched.append(ch)
             else:
-                tail = chunks[i - 1][-overlap:]
-                stitched.append(f"{tail}\n{ch}".strip())
+                stitched.append(f"{_overlap_tail(chunks[i - 1], overlap)}\n{ch}".strip())
         chunks = stitched
     return [c for c in chunks if c.strip()]
+
+
+def _overlap_tail(text: str, overlap: int) -> str:
+    """The last ~``overlap`` characters, starting on a line or word boundary."""
+    tail = text[-overlap:]
+    if len(tail) < len(text):
+        for sep in ("\n", " "):
+            cut = tail.find(sep)
+            if 0 <= cut < len(tail) - 1:
+                return tail[cut + 1 :]
+    return tail
 
 
 def extract_pdf_text(data: bytes) -> str:
@@ -446,7 +451,9 @@ class RagService:
         """Answer from the guild's docs, citing only what the answer uses."""
         store = self.store_for(guild_id)
         if store.size == 0 and not store.load_error:
-            return RagAnswer(text=NO_INDEX_TEXT, sources=[], hits=[], found=False)
+            return RagAnswer(
+                text=NO_INDEX_TEXT, sources=[], hits=[], found=False, indexed=False
+            )
         hits = await self.retrieve(guild_id, question)
         if not hits:
             # Nothing is relevant enough: skip the chat call entirely.
