@@ -8,6 +8,7 @@ response budget.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from typing import List, Optional
@@ -16,13 +17,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .config import SIGNUP_HINT, Settings, load_settings
+from .config import SIGNUP_HINT, Settings, load_env_file, load_settings
 from .middleware import GuildGuard, RateLimiter, build_error_handler, send_ephemeral
 from .moderation import ModerationService
 from .nim_client import NimClient, NimError
 from .persistence import Database
 from .personas import DEFAULT_PERSONA, PERSONAS, get_persona
-from .rag import RagService, extract_pdf_text
+from .rag import RagIndexError, RagService, extract_pdf_text
+from .textutil import build_transcript, split_message
 
 log = logging.getLogger("bot")
 
@@ -80,23 +82,8 @@ class DiscordAIBot(commands.Bot):
 
 
 # --------------------------------------------------------------- output helpers
-def split_message(text: str, limit: int = 1900) -> List[str]:
-    """Split text into <=limit chunks, preferring newline boundaries."""
-    text = text or "(empty response)"
-    if len(text) <= limit:
-        return [text]
-    chunks: List[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        window = remaining[:limit]
-        cut = window.rfind("\n")
-        if cut < limit // 2:
-            cut = limit
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip("\n")
-    if remaining:
-        chunks.append(remaining)
-    return chunks
+# split_message now lives in bot.textutil (fence-aware); re-exported here.
+__all__ = ["DiscordAIBot", "register_commands", "split_message", "main"]
 
 
 async def send_long(interaction: discord.Interaction, text: str) -> None:
@@ -157,8 +144,9 @@ def register_commands(bot: DiscordAIBot) -> None:
         except NimError as exc:
             await interaction.followup.send(str(exc))
             return
-        await bot.db.add_history(interaction.channel_id, "user", prompt)
-        await bot.db.add_history(interaction.channel_id, "assistant", answer)
+        gid = interaction.guild_id
+        await bot.db.add_history(interaction.channel_id, "user", prompt, guild_id=gid)
+        await bot.db.add_history(interaction.channel_id, "assistant", answer, guild_id=gid)
         await bot.db.trim_history(interaction.channel_id, cfg.history_window * 2)
         await send_long(interaction, answer)
 
@@ -188,7 +176,8 @@ def register_commands(bot: DiscordAIBot) -> None:
         if not collected:
             await interaction.followup.send("Nothing to summarize here yet.")
             return
-        transcript = "\n".join(collected)[:12000]
+        # Keep the NEWEST messages that fit the budget (never drop the latest).
+        transcript = build_transcript(collected, settings.summarize_char_budget)
         messages = [
             {
                 "role": "system",
@@ -198,14 +187,14 @@ def register_commands(bot: DiscordAIBot) -> None:
                     "Use Discord markdown bullets. Do not invent details."
                 ),
             },
-            {"role": "user", "content": transcript},
+            {"role": "user", "content": transcript.text},
         ]
         try:
             summary = await bot.nim.chat(messages, temperature=0.3)
         except NimError as exc:
             await interaction.followup.send(str(exc))
             return
-        header = f"**Summary of the last {len(collected)} messages**\n"
+        header = transcript.header() + "\n"
         await send_long(interaction, header + summary)
 
     # ----------------------------------------------------------------- /image
@@ -379,14 +368,12 @@ def register_commands(bot: DiscordAIBot) -> None:
             return
         await interaction.response.defer(thinking=True)
         try:
-            answer, cited = await bot.rag.answer(interaction.guild_id, question)
-        except NimError as exc:
+            result = await bot.rag.answer(interaction.guild_id, question)
+        except (NimError, RagIndexError) as exc:
             await interaction.followup.send(str(exc))
             return
-        if cited:
-            lines = [f"[{i}] {chunk.source}" for i, chunk in enumerate(cited, start=1)]
-            answer = f"{answer}\n\n**Sources**\n" + "\n".join(lines)
-        await send_long(interaction, answer)
+        # Only the excerpts the answer actually cites are listed as sources.
+        await send_long(interaction, result.formatted())
 
     @docs.command(
         name="ingest", description="Index pinned messages and files in the docs channel."
@@ -434,15 +421,20 @@ def register_commands(bot: DiscordAIBot) -> None:
     async def docs_status(interaction: discord.Interaction) -> None:
         if not await precheck(interaction, "docs_status", rate_limit=False):
             return
-        store = bot.rag.store_for(interaction.guild_id)
+        status = bot.rag.status(interaction.guild_id)
         cfg = await bot.db.get_guild_config(interaction.guild_id)
         channel = (
             f"<#{cfg.docs_channel_id}>" if cfg.docs_channel_id else "not set"
         )
-        await send_ephemeral(
-            interaction,
-            f"Indexed chunks: **{store.size}**\nDocs channel: {channel}",
-        )
+        lines = [
+            f"Indexed chunks: **{status['chunks']}** from {status['sources']} source(s)",
+            f"Docs channel: {channel}",
+        ]
+        if status["embed_model"]:
+            lines.append(f"Embedding model: `{status['embed_model']}` ({status['dim']}-d)")
+        if status["error"]:
+            lines.append(f"Problem: {status['error']}")
+        await send_ephemeral(interaction, "\n".join(lines))
 
     bot.tree.add_command(docs)
 
@@ -658,9 +650,12 @@ def register_commands(bot: DiscordAIBot) -> None:
                 "Nothing wiped. Re-run with `confirm: True` to erase all stored data.",
             )
             return
-        channel_ids = [c.id for c in interaction.guild.text_channels]
+        # Memory is matched by guild_id (threads, forums, deleted channels too);
+        # the channel ids only catch rows stored before schema v2.
+        guild = interaction.guild
+        channel_ids = [c.id for c in guild.channels] + [t.id for t in guild.threads]
         await bot.db.clear_guild_data(interaction.guild_id, channel_ids)
-        bot.rag.store_for(interaction.guild_id).clear()
+        bot.rag.forget(interaction.guild_id)
         await send_ephemeral(
             interaction,
             "Wiped: channel memory, usage counters, config and the docs index.",
@@ -730,14 +725,18 @@ async def _collect_documents(channel: discord.TextChannel):
             text = data.decode("utf-8", errors="replace")
         elif name.endswith(".pdf"):
             data = await att.read()
-            text = extract_pdf_text(data)
+            # pypdf is CPU-bound: keep it off the event loop (gateway heartbeat).
+            text = await asyncio.to_thread(extract_pdf_text, data)
         if text.strip():
             documents.append((f"{label_prefix}{att.filename}", text))
 
+    # ``await channel.pins()`` is deprecated and stops at 50; iterate them all.
+    pins = []
     try:
-        pins = await channel.pins()
+        async for msg in channel.pins(limit=None):
+            pins.append(msg)
     except discord.HTTPException:
-        pins = []
+        log.warning("Could not read pins in #%s", getattr(channel, "name", "?"))
     for msg in pins:
         if msg.content.strip():
             documents.append(
@@ -762,6 +761,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    load_env_file()  # <repo>/.env only; never a parent directory's .env
     settings = load_settings()
 
     if not settings.discord_token:

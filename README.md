@@ -28,8 +28,8 @@ to any other OpenAI-compatible backend.
 
 | Command | What it does |
 | ------- | ------------ |
-| `/ask` | Chat with the AI. Remembers the last N turns **per channel** so context carries between questions. |
-| `/summarize` | Reads the last 5–200 messages and returns a bullet summary with decisions and action items. |
+| `/ask` | Chat with the AI. Remembers the last N **messages** per channel (default 12, i.e. 6 question/answer exchanges) so context carries between questions. |
+| `/summarize` | Reads the last 5–200 messages and returns a bullet summary with decisions and action items. If the transcript is too long for the model, the **oldest** messages are dropped and the header says so ("last 150 of 200 messages"). |
 | `/image` | Attach an image and ask about it. Uses a NIM vision model. |
 | `/docs ask` | Answers strictly from your ingested server docs, with numbered citations. |
 | `/docs ingest` | Indexes pinned messages and `.txt` / `.md` / `.pdf` attachments from a docs channel. |
@@ -202,7 +202,9 @@ configured.
 | Usage counters | `usage` table | `/config wipe` |
 | Moderation exempt list | `mod_allowlist` table | `/config wipe` |
 
-`/config wipe confirm: true` erases **all** of the above for a server in one shot.
+`/config wipe confirm: true` erases **all** of the above for a server in one shot,
+including `/ask` memory kept in threads, forum posts and channels that have
+since been deleted (memory rows carry their server id since schema v2).
 Deleting the `data/` directory resets the bot completely.
 
 ---

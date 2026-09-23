@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import defaultdict, deque
-from typing import Deque, Dict, Optional, Set, Tuple
+from collections import deque
+from typing import Callable, Deque, Dict, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
@@ -22,28 +22,61 @@ class RateLimiter:
 
     * ``cooldown_seconds`` — minimum gap between two calls by the same user.
     * ``per_minute`` — max calls per user in any rolling 60-second window.
+
+    Users idle for longer than both limits are evicted (checked at most once
+    per ``prune_interval`` seconds), so memory stays proportional to the number
+    of *recently active* users instead of growing for the bot's whole lifetime.
     """
 
-    def __init__(self, cooldown_seconds: float, per_minute: int) -> None:
+    WINDOW_SECONDS = 60.0
+
+    def __init__(
+        self,
+        cooldown_seconds: float,
+        per_minute: int,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        prune_interval: float = 60.0,
+    ) -> None:
         self.cooldown = max(0.0, cooldown_seconds)
         self.per_minute = max(1, per_minute)
+        self._clock = clock
+        self._prune_interval = max(0.0, prune_interval)
+        self._last_prune = clock()
         self._last_call: Dict[int, float] = {}
-        self._windows: Dict[int, Deque[float]] = defaultdict(deque)
+        self._windows: Dict[int, Deque[float]] = {}
+
+    @property
+    def tracked_users(self) -> int:
+        return len(self._last_call)
+
+    def prune(self, now: Optional[float] = None) -> int:
+        """Forget users whose last call is older than every limit. Returns count."""
+        now = self._clock() if now is None else now
+        horizon = now - max(self.cooldown, self.WINDOW_SECONDS)
+        stale = [uid for uid, last in self._last_call.items() if last < horizon]
+        for uid in stale:
+            self._last_call.pop(uid, None)
+            self._windows.pop(uid, None)
+        self._last_prune = now
+        return len(stale)
 
     def check(self, user_id: int) -> Tuple[bool, float]:
         """Return ``(allowed, retry_after_seconds)`` and record the call if allowed."""
-        now = time.monotonic()
+        now = self._clock()
+        if now - self._last_prune >= self._prune_interval:
+            self.prune(now)
 
         last = self._last_call.get(user_id)
         if last is not None and (now - last) < self.cooldown:
             return False, round(self.cooldown - (now - last), 1)
 
-        window = self._windows[user_id]
-        cutoff = now - 60.0
+        window = self._windows.setdefault(user_id, deque())
+        cutoff = now - self.WINDOW_SECONDS
         while window and window[0] < cutoff:
             window.popleft()
         if len(window) >= self.per_minute:
-            retry = round(60.0 - (now - window[0]), 1)
+            retry = round(self.WINDOW_SECONDS - (now - window[0]), 1)
             return False, max(retry, 0.1)
 
         window.append(now)

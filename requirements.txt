@@ -1,5 +1,5 @@
 # Core runtime dependencies. Pin minimum versions known to work together.
-discord.py>=2.4.0        # Discord gateway + app_commands (slash commands)
+discord.py>=2.6.0        # Discord gateway + app_commands; 2.6 added the paginated pins iterator
 openai>=1.30.0           # OpenAI-compatible client, points at the NIM endpoint
 aiosqlite>=0.20.0        # async SQLite for config, memory and usage counters
 numpy>=1.26.0            # in-process vector store for RAG

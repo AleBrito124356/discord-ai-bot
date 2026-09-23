@@ -48,13 +48,13 @@ You can generate the URL in the **OAuth2 -> URL Generator** tab (tick both scope
 then tick the channel permissions below), or build it by hand:
 
 ```
-https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=117824&scope=bot%20applications.commands
+https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=84992&scope=bot%20applications.commands
 ```
 
 Replace `YOUR_APPLICATION_ID` with the **Application ID** from the **General
 Information** tab.
 
-### Permission integer 117824
+### Permission integer 84992
 
 That integer requests exactly the channel permissions the bot uses:
 
@@ -63,9 +63,7 @@ That integer requests exactly the channel permissions the bot uses:
 | View Channels         | See the channels it operates in       |
 | Send Messages         | Reply to commands                     |
 | Embed Links           | `/help`, `/config show`, mod advisories |
-| Attach Files          | Future-proofing for file replies      |
-| Read Message History  | `/summarize` and docs ingestion       |
-| Add Reactions         | Lightweight acknowledgements          |
+| Read Message History  | `/summarize`, docs ingestion (all pins) |
 
 The bot requests **no** moderation powers (no Ban, Kick, Manage Messages). That is
 deliberate — see the moderation philosophy in the README. If you want it to *only*
