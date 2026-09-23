@@ -117,10 +117,16 @@ def normalize_image(
     fmt = (img.format or "UNKNOWN").upper()
     frames = int(getattr(img, "n_frames", 1) or 1)
     original: Tuple[int, int] = img.size
+    try:
+        orientation = int(img.getexif().get(0x0112, 1) or 1)  # EXIF Orientation
+    except Exception:  # noqa: BLE001 - broken EXIF must not block the upload
+        orientation = 1
 
     if (
         fmt in PASSTHROUGH_FORMATS
         and frames == 1
+        and orientation == 1  # a rotated phone photo is re-encoded upright
+
         and max(original) <= max_side
         and b64_length(len(data)) <= max_b64
     ):
@@ -167,6 +173,8 @@ def normalize_image(
         steps.append(f"converted {fmt}{' (first frame)' if frames > 1 else ''} to JPEG")
     elif frames > 1:
         steps.append("used the first frame")
+    elif orientation != 1:
+        steps.append(f"rotated {fmt} upright (EXIF) and re-encoded it as JPEG")
     else:
         steps.append(f"re-encoded {fmt} as JPEG")
     if rgb.size != original:

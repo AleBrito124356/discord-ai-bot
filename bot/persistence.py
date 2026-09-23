@@ -164,18 +164,24 @@ class Database:
         return self._conn
 
     # -------------------------------------------------------- guild config
-    async def get_guild_config(self, guild_id: int) -> GuildConfig:
-        # INSERT OR IGNORE first: a SELECT-then-INSERT pair races when two
-        # events for a brand-new guild arrive together (UNIQUE constraint).
-        cur = await self._db.execute(
-            "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,)
-        )
-        if cur.rowcount:
-            await self._db.commit()
+    async def _select_config(self, guild_id: int):
         async with self._db.execute(
             "SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,)
         ) as cur:
-            row = await cur.fetchone()
+            return await cur.fetchone()
+
+    async def get_guild_config(self, guild_id: int) -> GuildConfig:
+        # Read first (on_message calls this for every message: no write, no
+        # open transaction on the hot path). On a miss, INSERT OR IGNORE: two
+        # events for a brand-new guild can both miss, and a plain INSERT made
+        # the second one fail with "UNIQUE constraint failed".
+        row = await self._select_config(guild_id)
+        if row is None:
+            await self._db.execute(
+                "INSERT OR IGNORE INTO guild_config (guild_id) VALUES (?)", (guild_id,)
+            )
+            await self._db.commit()
+            row = await self._select_config(guild_id)
         return GuildConfig(
             guild_id=row["guild_id"],
             persona=row["persona"],

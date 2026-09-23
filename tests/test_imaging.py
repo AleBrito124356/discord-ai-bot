@@ -97,6 +97,19 @@ def test_small_png_passes_through_unchanged():
     assert result.note == ""
 
 
+def test_exif_rotated_photo_is_turned_upright_even_when_small():
+    img = Image.new("RGB", (400, 200), (255, 0, 0))
+    img.paste((0, 0, 255), (0, 0, 200, 200))  # left half blue
+    exif = Image.Exif()
+    exif[0x0112] = 6  # "rotate 90 CW to display"
+    data = _encode(img, "JPEG", exif=exif.tobytes())
+    result = normalize_image(data, "image/jpeg")
+    decoded = _check_fits(result).convert("RGB")
+    assert result.changed and decoded.size == (200, 400)  # now portrait
+    assert decoded.getpixel((100, 20))[2] > 200  # blue half on top after rotation
+    assert "rotated JPEG upright (EXIF)" in result.note
+
+
 def test_tight_budget_lowers_quality_then_size():
     data = _encode(_noise((1500, 1000)), "PNG")
     result = normalize_image(data, "image/png", max_side=1568, max_b64=20_000)
