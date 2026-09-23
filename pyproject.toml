@@ -50,4 +50,6 @@ asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
     # Any use of the deprecated ``await channel.pins()`` must fail loudly.
     "error:.*pins.*:DeprecationWarning",
+    # discord.py itself still calls asyncio.iscoroutinefunction on Python 3.14.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
 ]

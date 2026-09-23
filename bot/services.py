@@ -258,9 +258,20 @@ class ModerationFlow:
         return cfg, result
 
 
+COMMAND_LABELS = {
+    "ctx_ask": "Ask AI about this (menu)",
+    "ctx_summarize": "Summarize from here (menu)",
+}
+
+
+def command_label(name: str) -> str:
+    """``docs_ask`` -> ``/docs ask``; context menus get their menu name."""
+    return COMMAND_LABELS.get(name) or "/" + name.replace("_", " ")
+
+
 def stats_lines(stats: UsageStats, label_user=lambda uid: f"<@{uid}>") -> Dict[str, str]:
     """Human-readable blocks for /stats and the CLI ``stats`` command."""
-    commands = "\n".join(f"`/{name.replace('_', ' ')}` — {n}" for name, n in stats.per_command)
+    commands = "\n".join(f"`{command_label(name)}` — {n}" for name, n in stats.per_command)
     users = "\n".join(
         f"{i}. {label_user(uid)} — {n}" for i, (uid, n) in enumerate(stats.top_users, 1)
     )

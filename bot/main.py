@@ -23,7 +23,8 @@ from discord.ext import commands
 from .config import SIGNUP_HINT, Settings, load_env_file, load_settings
 from .middleware import GuildGuard, RateLimiter, build_error_handler, send_ephemeral
 from .personas import PERSONAS
-from .services import BotCore, document_text, is_document
+from .persistence import UsageStats
+from .services import BotCore, Reply, document_text, is_document, stats_lines
 from .textutil import split_message
 
 __all__ = ["DiscordAIBot", "register_commands", "split_message", "main"]
@@ -44,6 +45,11 @@ COMMON_MODELS = [
 # downscaled to what the vision model accepts (see bot/imaging.py).
 MAX_IMAGE_UPLOAD = 25 * 1024 * 1024
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+
+# Message context menus (right-click a message -> Apps). Names are shown as-is.
+ASK_ABOUT_MENU = "Ask AI about this"
+SUMMARIZE_FROM_MENU = "Summarize from here"
+SUMMARIZE_FROM_LIMIT = 200  # same ceiling as /summarize
 
 
 # --------------------------------------------------------------------------- bot
@@ -282,6 +288,71 @@ def register_commands(bot: DiscordAIBot) -> None:
             interaction,
             f"Cleared {removed} stored message(s) of context for this channel.",
         )
+
+    # ----------------------------------------------------------------- /stats
+    @bot.tree.command(name="stats", description="Usage statistics for this server.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def stats_cmd(interaction: discord.Interaction) -> None:
+        if not await precheck(interaction, "stats", rate_limit=False):
+            return
+        stats = await core.db.usage_stats(interaction.guild_id)
+        chunks = core.rag.status(interaction.guild_id)["chunks"]
+        await interaction.response.send_message(
+            embed=build_stats_embed(stats, chunks), ephemeral=True
+        )
+
+    # -------------------------------------------------- message context menus
+    @bot.tree.context_menu(name=ASK_ABOUT_MENU)
+    @app_commands.guild_only()
+    async def ask_about_message(
+        interaction: discord.Interaction, message: discord.Message
+    ) -> None:
+        """Explain/answer a message; describe its image if it has one."""
+        if not await precheck(interaction, "ctx_ask"):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        author = message.author.display_name
+        image = next(
+            (a for a in message.attachments if _is_image(a) and a.size <= MAX_IMAGE_UPLOAD),
+            None,
+        )
+        if image is not None:
+            reply = await core.vision.describe_in_message(
+                await image.read(), image.content_type, author, message.clean_content or ""
+            )
+        elif (message.clean_content or "").strip():
+            reply = await core.ask.explain(
+                interaction.guild_id, author, message.clean_content
+            )
+        else:
+            reply = Reply("That message has no text or image I can look at.", ok=False)
+        await send_long(interaction, reply.render(), ephemeral=True)
+
+    @bot.tree.context_menu(name=SUMMARIZE_FROM_MENU)
+    @app_commands.guild_only()
+    async def summarize_from_message(
+        interaction: discord.Interaction, message: discord.Message
+    ) -> None:
+        """Summarize the conversation from the selected message onward."""
+        if not await precheck(interaction, "ctx_summarize"):
+            return
+        await interaction.response.defer(thinking=True)
+        lines = []
+        first = _transcript_line(message)
+        if first:
+            lines.append(first)
+        async for msg in interaction.channel.history(
+            after=message, limit=SUMMARIZE_FROM_LIMIT - 1, oldest_first=True
+        ):
+            line = _transcript_line(msg)
+            if line:
+                lines.append(line)
+        reply = await core.summarizer.summarize(
+            lines, keep="oldest", anchor=message.jump_url
+        )
+        await send_long(interaction, reply.render())
 
     # ------------------------------------------------------------------ /help
     @bot.tree.command(name="help", description="How to use this bot.")
@@ -627,12 +698,21 @@ def build_help_embed(offline: bool = False) -> discord.Embed:
         inline=False,
     )
     embed.add_field(
+        name="Right-click a message → Apps",
+        value=(
+            f"**{ASK_ABOUT_MENU}** — explain or answer it (describes its image, if any)\n"
+            f"**{SUMMARIZE_FROM_MENU}** — summarize the conversation from there on"
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="Moderators (Manage Server)",
         value=(
             "`/persona` — switch the bot's persona\n"
             "`/model` — view or set the chat model\n"
             "`/forget` — wipe this channel's memory (Manage Messages)\n"
             "`/docs ingest` — index the docs channel\n"
+            "`/stats` — usage per command and top users\n"
             "`/config …` — mod channel, docs channel, moderation, wipe"
         ),
         inline=False,
@@ -641,6 +721,21 @@ def build_help_embed(offline: bool = False) -> discord.Embed:
     if offline:
         footer += " Offline backend active: answers are extractive, not generated."
     embed.set_footer(text=footer)
+    return embed
+
+
+def build_stats_embed(stats: UsageStats, indexed_chunks: int) -> discord.Embed:
+    blocks = stats_lines(stats)
+    embed = discord.Embed(
+        title="Usage for this server",
+        description=blocks["total"],
+        colour=discord.Color.blurple(),
+    )
+    embed.add_field(name="Per command", value=blocks["commands"][:1024], inline=False)
+    embed.add_field(name="Top users", value=blocks["users"][:1024], inline=False)
+    embed.add_field(name="Memory", value=blocks["memory"], inline=True)
+    embed.add_field(name="Indexed doc chunks", value=str(indexed_chunks), inline=True)
+    embed.set_footer(text="Counts every accepted command. /config wipe resets them.")
     return embed
 
 
