@@ -3,6 +3,9 @@
 End-to-end: create the Discord application, get your keys, invite the bot, and
 run it locally, under systemd, or in Docker.
 
+> Just evaluating? `python -m bot.cli --help` runs every feature from a terminal
+> with no Discord app and no NVIDIA key (see "Try it with no keys" in the README).
+
 ---
 
 ## 1. Create the Discord application and bot
@@ -16,7 +19,7 @@ run it locally, under systemd, or in Docker.
 ### Enable the required intent
 
 This bot needs the **Message Content Intent** so it can read message text for
-`/summarize` and for assist-only moderation.
+`/summarize`, the *Summarize from here* menu and assist-only moderation.
 
 - In the **Bot** tab, scroll to **Privileged Gateway Intents**.
 - Turn on **Message Content Intent**. Save.
@@ -48,13 +51,13 @@ You can generate the URL in the **OAuth2 -> URL Generator** tab (tick both scope
 then tick the channel permissions below), or build it by hand:
 
 ```
-https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=117824&scope=bot%20applications.commands
+https://discord.com/api/oauth2/authorize?client_id=YOUR_APPLICATION_ID&permissions=84992&scope=bot%20applications.commands
 ```
 
 Replace `YOUR_APPLICATION_ID` with the **Application ID** from the **General
 Information** tab.
 
-### Permission integer 117824
+### Permission integer 84992
 
 That integer requests exactly the channel permissions the bot uses:
 
@@ -63,9 +66,10 @@ That integer requests exactly the channel permissions the bot uses:
 | View Channels         | See the channels it operates in       |
 | Send Messages         | Reply to commands                     |
 | Embed Links           | `/help`, `/config show`, mod advisories |
-| Attach Files          | Future-proofing for file replies      |
-| Read Message History  | `/summarize` and docs ingestion       |
-| Add Reactions         | Lightweight acknowledgements          |
+| Read Message History  | `/summarize`, *Summarize from here*, docs ingestion (all pins) |
+
+The two message context menus (*Ask AI about this*, *Summarize from here*) are
+registered together with the slash commands and need no extra permission.
 
 The bot requests **no** moderation powers (no Ban, Kick, Manage Messages). That is
 deliberate — see the moderation philosophy in the README. If you want it to *only*
@@ -158,4 +162,7 @@ restarts and image rebuilds.
 | `PrivilegedIntentsRequired` on startup | Enable the Message Content Intent in the Bot tab. |
 | Every NIM call fails with 401 | Wrong or expired `NVIDIA_API_KEY`. Regenerate at build.nvidia.com. |
 | `/summarize` reads nothing | The bot lacks Read Message History in that channel, or the channel is empty of human messages. |
-| Vision returns an error | The attachment is not an image, or is over 12 MB. |
+| Vision returns an error | The attachment is not a readable image or is over 25 MB. Anything else is converted and downscaled automatically (`NIM_IMAGE_MAX_SIDE`, `NIM_IMAGE_MAX_B64`). |
+| `/docs ask` says the index was built with another model | You changed `NIM_EMBED_MODEL` (or switched to/from offline mode). Run `/docs ingest` again. |
+| `/docs ask` cites unrelated docs, or finds nothing | Tune `RAG_MIN_SCORE` (default 0.2 with NIM): raise it to drop weak matches, lower it if good matches are being filtered. |
+| Want to test the setup before getting an NVIDIA key | Start with `BOT_OFFLINE=1`: every command works on the deterministic offline backend. |

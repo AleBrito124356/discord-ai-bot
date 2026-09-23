@@ -5,24 +5,29 @@ Run with:  python -m bot.main   (from the repository root)
 The bot is intentionally guild-only. Every AI command defers first (Discord shows
 a "thinking" indicator) because NIM calls take longer than the 3-second initial
 response budget.
+
+The handlers here are thin adapters: they read what Discord gives them, call a
+service from ``bot/services.py`` with plain ids and strings, and render the
+:class:`~bot.services.Reply`. The same services power ``python -m bot.cli``.
 """
 from __future__ import annotations
 
 import logging
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .config import SIGNUP_HINT, Settings, load_settings
+from .config import SIGNUP_HINT, Settings, load_env_file, load_settings
 from .middleware import GuildGuard, RateLimiter, build_error_handler, send_ephemeral
-from .moderation import ModerationService
-from .nim_client import NimClient, NimError
-from .persistence import Database
-from .personas import DEFAULT_PERSONA, PERSONAS, get_persona
-from .rag import RagService, extract_pdf_text
+from .personas import PERSONAS
+from .persistence import UsageStats
+from .services import BotCore, Reply, document_text, is_document, stats_lines
+from .textutil import split_message
+
+__all__ = ["DiscordAIBot", "register_commands", "split_message", "main"]
 
 log = logging.getLogger("bot")
 
@@ -36,12 +41,20 @@ COMMON_MODELS = [
     "qwen/qwen2.5-coder-32b-instruct",
 ]
 
-TEXT_EXTS = (".txt", ".md", ".markdown", ".text", ".log", ".csv", ".json", ".rst")
+# Anything bigger is refused before download; smaller images are converted and
+# downscaled to what the vision model accepts (see bot/imaging.py).
+MAX_IMAGE_UPLOAD = 25 * 1024 * 1024
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+
+# Message context menus (right-click a message -> Apps). Names are shown as-is.
+ASK_ABOUT_MENU = "Ask AI about this"
+SUMMARIZE_FROM_MENU = "Summarize from here"
+SUMMARIZE_FROM_LIMIT = 200  # same ceiling as /summarize
 
 
 # --------------------------------------------------------------------------- bot
 class DiscordAIBot(commands.Bot):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, nim=None) -> None:
         intents = discord.Intents.default()
         intents.message_content = True  # required for /summarize and moderation
         super().__init__(
@@ -50,17 +63,19 @@ class DiscordAIBot(commands.Bot):
             help_command=None,
         )
         self.settings = settings
-        self.db = Database(settings.db_path)
-        self.nim = NimClient(settings)
-        self.rag = RagService(settings, self.nim)
-        self.moderation = ModerationService(settings, self.nim)
+        self.core = BotCore(settings, nim=nim)
+        # Shortcuts kept for backwards compatibility with 1.0 code.
+        self.db = self.core.db
+        self.nim = self.core.nim
+        self.rag = self.core.rag
+        self.moderation = self.core.moderation
         self.guard = GuildGuard(settings.allowed_guild_ids)
         self.limiter = RateLimiter(
             settings.cooldown_seconds, settings.rate_limit_per_minute
         )
 
     async def setup_hook(self) -> None:
-        await self.db.connect()
+        await self.core.start()
         self.tree.on_error = build_error_handler(self.tree)
         register_commands(self)
         if self.settings.allowed_guild_ids:
@@ -74,40 +89,28 @@ class DiscordAIBot(commands.Bot):
             log.info("Synced %d global commands (rollout can take up to 1h)", len(synced))
 
     async def close(self) -> None:
-        await self.nim.close()
-        await self.db.close()
+        await self.core.close()
         await super().close()
 
 
 # --------------------------------------------------------------- output helpers
-def split_message(text: str, limit: int = 1900) -> List[str]:
-    """Split text into <=limit chunks, preferring newline boundaries."""
-    text = text or "(empty response)"
-    if len(text) <= limit:
-        return [text]
-    chunks: List[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        window = remaining[:limit]
-        cut = window.rfind("\n")
-        if cut < limit // 2:
-            cut = limit
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip("\n")
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-async def send_long(interaction: discord.Interaction, text: str) -> None:
+async def send_long(
+    interaction: discord.Interaction, text: str, *, ephemeral: bool = False
+) -> None:
     """Send a possibly long response via followups (used after defer)."""
     for chunk in split_message(text):
-        await interaction.followup.send(chunk)
+        await interaction.followup.send(chunk, ephemeral=ephemeral)
+
+
+def _is_image(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    return content_type.startswith("image/") or attachment.filename.lower().endswith(IMAGE_EXTS)
 
 
 # --------------------------------------------------------------- command wiring
 def register_commands(bot: DiscordAIBot) -> None:
     settings = bot.settings
+    core = bot.core
 
     async def precheck(
         interaction: discord.Interaction, command: str, *, rate_limit: bool = True
@@ -128,7 +131,7 @@ def register_commands(bot: DiscordAIBot) -> None:
                     interaction, f"Please wait {retry:.1f}s before trying again."
                 )
                 return False
-        await bot.db.increment_usage(
+        await core.db.increment_usage(
             interaction.guild_id, interaction.user.id, command
         )
         return True
@@ -143,24 +146,8 @@ def register_commands(bot: DiscordAIBot) -> None:
         if not await precheck(interaction, "ask"):
             return
         await interaction.response.defer(thinking=True)
-        cfg = await bot.db.get_guild_config(interaction.guild_id)
-        persona = get_persona(cfg.persona)
-        history = await bot.db.get_history(interaction.channel_id, cfg.history_window)
-        messages = (
-            [{"role": "system", "content": persona["system"]}]
-            + history
-            + [{"role": "user", "content": prompt}]
-        )
-        model = cfg.chat_model or settings.chat_model
-        try:
-            answer = await bot.nim.chat(messages, model=model)
-        except NimError as exc:
-            await interaction.followup.send(str(exc))
-            return
-        await bot.db.add_history(interaction.channel_id, "user", prompt)
-        await bot.db.add_history(interaction.channel_id, "assistant", answer)
-        await bot.db.trim_history(interaction.channel_id, cfg.history_window * 2)
-        await send_long(interaction, answer)
+        reply = await core.ask.ask(interaction.guild_id, interaction.channel_id, prompt)
+        await send_long(interaction, reply.render())
 
     # ------------------------------------------------------------- /summarize
     @bot.tree.command(
@@ -176,37 +163,14 @@ def register_commands(bot: DiscordAIBot) -> None:
         if not await precheck(interaction, "summarize"):
             return
         await interaction.response.defer(thinking=True)
-        channel = interaction.channel
-        collected = []
-        async for msg in channel.history(limit=int(count)):
-            if msg.author.bot:
-                continue
-            body = msg.clean_content.strip()
-            if body:
-                collected.append(f"{msg.author.display_name}: {body}")
-        collected.reverse()
-        if not collected:
-            await interaction.followup.send("Nothing to summarize here yet.")
-            return
-        transcript = "\n".join(collected)[:12000]
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Summarize the following Discord conversation into 3-7 concise "
-                    "bullet points capturing decisions, questions and action items. "
-                    "Use Discord markdown bullets. Do not invent details."
-                ),
-            },
-            {"role": "user", "content": transcript},
-        ]
-        try:
-            summary = await bot.nim.chat(messages, temperature=0.3)
-        except NimError as exc:
-            await interaction.followup.send(str(exc))
-            return
-        header = f"**Summary of the last {len(collected)} messages**\n"
-        await send_long(interaction, header + summary)
+        lines = []
+        async for msg in interaction.channel.history(limit=int(count)):
+            line = _transcript_line(msg)
+            if line:
+                lines.append(line)
+        lines.reverse()  # history() is newest-first; transcripts are oldest-first
+        reply = await core.summarizer.summarize(lines)
+        await send_long(interaction, reply.render())
 
     # ----------------------------------------------------------------- /image
     @bot.tree.command(
@@ -224,25 +188,21 @@ def register_commands(bot: DiscordAIBot) -> None:
     ) -> None:
         if not await precheck(interaction, "image"):
             return
-        content_type = image.content_type or ""
-        if not content_type.startswith("image/"):
+        if not _is_image(image):
             await send_ephemeral(
-                interaction, "Please attach an image file (PNG, JPG, WEBP, GIF)."
+                interaction, "Please attach an image file (PNG, JPG, WEBP, GIF, BMP)."
             )
             return
-        if image.size > 12 * 1024 * 1024:
+        if image.size > MAX_IMAGE_UPLOAD:
             await send_ephemeral(
-                interaction, "That image is too large (max 12 MB for vision)."
+                interaction,
+                f"That image is too large (max {MAX_IMAGE_UPLOAD // (1024 * 1024)} MB).",
             )
             return
         await interaction.response.defer(thinking=True)
         data = await image.read()
-        try:
-            answer = await bot.nim.vision(question, data, content_type)
-        except NimError as exc:
-            await interaction.followup.send(str(exc))
-            return
-        await send_long(interaction, answer)
+        reply = await core.vision.describe(data, image.content_type, question)
+        await send_long(interaction, reply.render())
 
     # --------------------------------------------------------------- /persona
     @bot.tree.command(
@@ -263,7 +223,7 @@ def register_commands(bot: DiscordAIBot) -> None:
     ) -> None:
         if not await precheck(interaction, "persona", rate_limit=False):
             return
-        await bot.db.set_guild_field(interaction.guild_id, "persona", name.value)
+        await core.db.set_guild_field(interaction.guild_id, "persona", name.value)
         meta = PERSONAS[name.value]
         await send_ephemeral(
             interaction,
@@ -294,21 +254,22 @@ def register_commands(bot: DiscordAIBot) -> None:
     ) -> None:
         if not await precheck(interaction, "model", rate_limit=False):
             return
-        cfg = await bot.db.get_guild_config(interaction.guild_id)
+        cfg = await core.db.get_guild_config(interaction.guild_id)
         if name is None:
             active = cfg.chat_model or settings.chat_model
+            backend = " (offline backend)" if core.offline else ""
             await send_ephemeral(
                 interaction,
-                f"Current chat model: `{active}`\nDefault: `{settings.chat_model}`",
+                f"Current chat model: `{active}`{backend}\nDefault: `{settings.chat_model}`",
             )
             return
         if name.lower() in {"default", "reset"}:
-            await bot.db.set_guild_field(interaction.guild_id, "chat_model", None)
+            await core.db.set_guild_field(interaction.guild_id, "chat_model", None)
             await send_ephemeral(
                 interaction, f"Reset to the default model: `{settings.chat_model}`"
             )
             return
-        await bot.db.set_guild_field(interaction.guild_id, "chat_model", name)
+        await core.db.set_guild_field(interaction.guild_id, "chat_model", name)
         await send_ephemeral(interaction, f"Chat model set to `{name}`.")
 
     # ---------------------------------------------------------------- /forget
@@ -322,48 +283,82 @@ def register_commands(bot: DiscordAIBot) -> None:
     async def forget(interaction: discord.Interaction) -> None:
         if not await precheck(interaction, "forget", rate_limit=False):
             return
-        removed = await bot.db.clear_history(interaction.channel_id)
+        removed = await core.db.clear_history(interaction.channel_id)
         await send_ephemeral(
             interaction,
             f"Cleared {removed} stored message(s) of context for this channel.",
         )
 
+    # ----------------------------------------------------------------- /stats
+    @bot.tree.command(name="stats", description="Usage statistics for this server.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def stats_cmd(interaction: discord.Interaction) -> None:
+        if not await precheck(interaction, "stats", rate_limit=False):
+            return
+        stats = await core.db.usage_stats(interaction.guild_id)
+        chunks = core.rag.status(interaction.guild_id)["chunks"]
+        await interaction.response.send_message(
+            embed=build_stats_embed(stats, chunks), ephemeral=True
+        )
+
+    # -------------------------------------------------- message context menus
+    @bot.tree.context_menu(name=ASK_ABOUT_MENU)
+    @app_commands.guild_only()
+    async def ask_about_message(
+        interaction: discord.Interaction, message: discord.Message
+    ) -> None:
+        """Explain/answer a message; describe its image if it has one."""
+        if not await precheck(interaction, "ctx_ask"):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        author = message.author.display_name
+        image = next(
+            (a for a in message.attachments if _is_image(a) and a.size <= MAX_IMAGE_UPLOAD),
+            None,
+        )
+        if image is not None:
+            reply = await core.vision.describe_in_message(
+                await image.read(), image.content_type, author, message.clean_content or ""
+            )
+        elif (message.clean_content or "").strip():
+            reply = await core.ask.explain(
+                interaction.guild_id, author, message.clean_content
+            )
+        else:
+            reply = Reply("That message has no text or image I can look at.", ok=False)
+        await send_long(interaction, reply.render(), ephemeral=True)
+
+    @bot.tree.context_menu(name=SUMMARIZE_FROM_MENU)
+    @app_commands.guild_only()
+    async def summarize_from_message(
+        interaction: discord.Interaction, message: discord.Message
+    ) -> None:
+        """Summarize the conversation from the selected message onward."""
+        if not await precheck(interaction, "ctx_summarize"):
+            return
+        await interaction.response.defer(thinking=True)
+        lines = []
+        first = _transcript_line(message)
+        if first:
+            lines.append(first)
+        async for msg in interaction.channel.history(
+            after=message, limit=SUMMARIZE_FROM_LIMIT - 1, oldest_first=True
+        ):
+            line = _transcript_line(msg)
+            if line:
+                lines.append(line)
+        reply = await core.summarizer.summarize(
+            lines, keep="oldest", anchor=message.jump_url
+        )
+        await send_long(interaction, reply.render())
+
     # ------------------------------------------------------------------ /help
     @bot.tree.command(name="help", description="How to use this bot.")
     @app_commands.guild_only()
     async def help_cmd(interaction: discord.Interaction) -> None:
-        embed = discord.Embed(
-            title="discord-ai-bot",
-            description="AI chat, summaries, vision and docs — on free NVIDIA NIM.",
-            colour=discord.Color.blurple(),
-        )
-        embed.add_field(
-            name="Everyone",
-            value=(
-                "`/ask` — chat with per-channel memory\n"
-                "`/summarize` — bullet-summary of recent messages\n"
-                "`/image` — ask about an uploaded image\n"
-                "`/docs ask` — answer from the server's ingested docs\n"
-                "`/docs status` — how many doc chunks are indexed\n"
-                "`/help` — this message"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="Moderators (Manage Server)",
-            value=(
-                "`/persona` — switch the bot's persona\n"
-                "`/model` — view or set the chat model\n"
-                "`/forget` — wipe this channel's memory (Manage Messages)\n"
-                "`/docs ingest` — index the docs channel\n"
-                "`/config …` — mod channel, docs channel, moderation, wipe"
-            ),
-            inline=False,
-        )
-        embed.set_footer(
-            text="Moderation is assist-only: the bot suggests, humans decide."
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=build_help_embed(core.offline), ephemeral=True)
 
     # -------------------------------------------------------------- docs group
     docs = app_commands.Group(
@@ -378,15 +373,9 @@ def register_commands(bot: DiscordAIBot) -> None:
         if not await precheck(interaction, "docs_ask"):
             return
         await interaction.response.defer(thinking=True)
-        try:
-            answer, cited = await bot.rag.answer(interaction.guild_id, question)
-        except NimError as exc:
-            await interaction.followup.send(str(exc))
-            return
-        if cited:
-            lines = [f"[{i}] {chunk.source}" for i, chunk in enumerate(cited, start=1)]
-            answer = f"{answer}\n\n**Sources**\n" + "\n".join(lines)
-        await send_long(interaction, answer)
+        # Only the excerpts the answer actually cites are listed as sources.
+        reply = await core.docs.ask(interaction.guild_id, question)
+        await send_long(interaction, reply.render())
 
     @docs.command(
         name="ingest", description="Index pinned messages and files in the docs channel."
@@ -396,7 +385,7 @@ def register_commands(bot: DiscordAIBot) -> None:
     async def docs_ingest(interaction: discord.Interaction) -> None:
         if not await precheck(interaction, "docs_ingest", rate_limit=False):
             return
-        cfg = await bot.db.get_guild_config(interaction.guild_id)
+        cfg = await core.db.get_guild_config(interaction.guild_id)
         if not cfg.docs_channel_id:
             await send_ephemeral(
                 interaction,
@@ -410,38 +399,20 @@ def register_commands(bot: DiscordAIBot) -> None:
             )
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
-        documents = await _collect_documents(channel)
-        if not documents:
-            await interaction.followup.send(
-                "Found no readable pins or .txt/.md/.pdf attachments in that channel.",
-                ephemeral=True,
-            )
-            return
-        try:
-            report = await bot.rag.ingest_documents(interaction.guild_id, documents)
-        except NimError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
-            return
-        msg = (
-            f"Indexed **{report.chunks}** chunks from **{report.documents}** "
-            f"document(s) in {channel.mention}."
+        documents = await collect_documents(channel)
+        reply = await core.docs.ingest(
+            interaction.guild_id, documents, where=channel.mention
         )
-        if report.skipped:
-            msg += f"\nSkipped {len(report.skipped)} empty source(s)."
-        await interaction.followup.send(msg, ephemeral=True)
+        await interaction.followup.send(reply.render(), ephemeral=True)
 
     @docs.command(name="status", description="Show how many doc chunks are indexed.")
     async def docs_status(interaction: discord.Interaction) -> None:
         if not await precheck(interaction, "docs_status", rate_limit=False):
             return
-        store = bot.rag.store_for(interaction.guild_id)
-        cfg = await bot.db.get_guild_config(interaction.guild_id)
-        channel = (
-            f"<#{cfg.docs_channel_id}>" if cfg.docs_channel_id else "not set"
-        )
+        cfg = await core.db.get_guild_config(interaction.guild_id)
+        channel = f"<#{cfg.docs_channel_id}>" if cfg.docs_channel_id else "not set"
         await send_ephemeral(
-            interaction,
-            f"Indexed chunks: **{store.size}**\nDocs channel: {channel}",
+            interaction, "\n".join(core.docs.status_lines(interaction.guild_id, channel))
         )
 
     bot.tree.add_command(docs)
@@ -459,9 +430,9 @@ def register_commands(bot: DiscordAIBot) -> None:
     async def config_show(interaction: discord.Interaction) -> None:
         if not await precheck(interaction, "config_show", rate_limit=False):
             return
-        cfg = await bot.db.get_guild_config(interaction.guild_id)
-        store = bot.rag.store_for(interaction.guild_id)
-        allow = await bot.db.get_allowlist(interaction.guild_id)
+        cfg = await core.db.get_guild_config(interaction.guild_id)
+        status = core.rag.status(interaction.guild_id)
+        allow = await core.db.get_allowlist(interaction.guild_id)
         embed = discord.Embed(
             title="Server configuration", colour=discord.Color.blurple()
         )
@@ -471,13 +442,15 @@ def register_commands(bot: DiscordAIBot) -> None:
             value=cfg.chat_model or f"default ({settings.chat_model})",
             inline=True,
         )
-        embed.add_field(name="History window", value=str(cfg.history_window), inline=True)
+        embed.add_field(
+            name="History window", value=f"{cfg.history_window} messages", inline=True
+        )
         embed.add_field(
             name="Docs channel",
             value=f"<#{cfg.docs_channel_id}>" if cfg.docs_channel_id else "not set",
             inline=True,
         )
-        embed.add_field(name="Indexed chunks", value=str(store.size), inline=True)
+        embed.add_field(name="Indexed chunks", value=str(status["chunks"]), inline=True)
         embed.add_field(
             name="Mod channel",
             value=f"<#{cfg.mod_channel_id}>" if cfg.mod_channel_id else "not set",
@@ -493,6 +466,8 @@ def register_commands(bot: DiscordAIBot) -> None:
             value=str(len(allow)) + " entr" + ("y" if len(allow) == 1 else "ies"),
             inline=True,
         )
+        if core.offline:
+            embed.set_footer(text="Running on the offline backend (no NVIDIA NIM calls).")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @config.command(
@@ -505,9 +480,7 @@ def register_commands(bot: DiscordAIBot) -> None:
     ) -> None:
         if not await precheck(interaction, "config_mod_channel", rate_limit=False):
             return
-        await bot.db.set_guild_field(
-            interaction.guild_id, "mod_channel_id", channel.id
-        )
+        await core.db.set_guild_field(interaction.guild_id, "mod_channel_id", channel.id)
         await send_ephemeral(
             interaction, f"Moderation advisories will be posted to {channel.mention}."
         )
@@ -522,9 +495,7 @@ def register_commands(bot: DiscordAIBot) -> None:
     ) -> None:
         if not await precheck(interaction, "config_docs_channel", rate_limit=False):
             return
-        await bot.db.set_guild_field(
-            interaction.guild_id, "docs_channel_id", channel.id
-        )
+        await core.db.set_guild_field(interaction.guild_id, "docs_channel_id", channel.id)
         await send_ephemeral(
             interaction,
             f"Docs channel set to {channel.mention}. Run `/docs ingest` to index it.",
@@ -540,14 +511,14 @@ def register_commands(bot: DiscordAIBot) -> None:
     ) -> None:
         if not await precheck(interaction, "config_moderation", rate_limit=False):
             return
-        cfg = await bot.db.get_guild_config(interaction.guild_id)
+        cfg = await core.db.get_guild_config(interaction.guild_id)
         if enabled and not cfg.mod_channel_id:
             await send_ephemeral(
                 interaction,
                 "Set a mod channel first with `/config mod-channel`.",
             )
             return
-        await bot.db.set_guild_field(interaction.guild_id, "moderation_on", enabled)
+        await core.db.set_guild_field(interaction.guild_id, "moderation_on", enabled)
         state = "enabled" if enabled else "disabled"
         note = (
             " The bot will only *suggest*; it never bans, kicks or deletes."
@@ -567,9 +538,7 @@ def register_commands(bot: DiscordAIBot) -> None:
     ) -> None:
         if not await precheck(interaction, "config_threshold", rate_limit=False):
             return
-        await bot.db.set_guild_field(
-            interaction.guild_id, "mod_threshold", float(value)
-        )
+        await core.db.set_guild_field(interaction.guild_id, "mod_threshold", float(value))
         await send_ephemeral(
             interaction, f"Moderation threshold set to {float(value):.2f}."
         )
@@ -585,11 +554,11 @@ def register_commands(bot: DiscordAIBot) -> None:
     ) -> None:
         if not await precheck(interaction, "config_history_window", rate_limit=False):
             return
-        await bot.db.set_guild_field(
-            interaction.guild_id, "history_window", int(size)
-        )
+        await core.db.set_guild_field(interaction.guild_id, "history_window", int(size))
         await send_ephemeral(
-            interaction, f"History window set to {int(size)} messages."
+            interaction,
+            f"History window set to {int(size)} messages "
+            f"(about {int(size) // 2} question/answer exchanges).",
         )
 
     @config.command(
@@ -611,10 +580,10 @@ def register_commands(bot: DiscordAIBot) -> None:
             return
         added = []
         if member is not None:
-            await bot.db.add_allowlist(interaction.guild_id, member.id, "user")
+            await core.db.add_allowlist(interaction.guild_id, member.id, "user")
             added.append(member.mention)
         if role is not None:
-            await bot.db.add_allowlist(interaction.guild_id, role.id, "role")
+            await core.db.add_allowlist(interaction.guild_id, role.id, "role")
             added.append(role.mention)
         await send_ephemeral(
             interaction, "Exempted from moderation: " + ", ".join(added)
@@ -638,7 +607,7 @@ def register_commands(bot: DiscordAIBot) -> None:
         if target_id is None:
             await send_ephemeral(interaction, "Provide a member or a role to remove.")
             return
-        removed = await bot.db.remove_allowlist(interaction.guild_id, target_id)
+        removed = await core.db.remove_allowlist(interaction.guild_id, target_id)
         await send_ephemeral(
             interaction,
             "Removed from the exempt list." if removed else "That was not on the list.",
@@ -658,12 +627,17 @@ def register_commands(bot: DiscordAIBot) -> None:
                 "Nothing wiped. Re-run with `confirm: True` to erase all stored data.",
             )
             return
-        channel_ids = [c.id for c in interaction.guild.text_channels]
-        await bot.db.clear_guild_data(interaction.guild_id, channel_ids)
-        bot.rag.store_for(interaction.guild_id).clear()
+        # Memory is matched by guild_id (threads, forums, deleted channels too);
+        # the channel ids only catch rows stored before schema v2.
+        guild = interaction.guild
+        channel_ids = [c.id for c in guild.channels] + [t.id for t in guild.threads]
+        removed = await core.db.clear_guild_data(interaction.guild_id, channel_ids)
+        core.rag.forget(interaction.guild_id)
         await send_ephemeral(
             interaction,
-            "Wiped: channel memory, usage counters, config and the docs index.",
+            f"Wiped: {removed['channel_history']} memory message(s) across all channels "
+            "and threads, usage counters, the moderation allowlist, config and the "
+            "docs index.",
         )
 
     bot.tree.add_command(config)
@@ -675,31 +649,26 @@ def register_commands(bot: DiscordAIBot) -> None:
             return
         if not bot.guard.is_allowed(message.guild.id):
             return
-        cfg = await bot.db.get_guild_config(message.guild.id)
-        if not cfg.moderation_on or not cfg.mod_channel_id:
-            return
-        if message.channel.id == cfg.mod_channel_id:
-            return
-        allow = await bot.db.get_allowlist(message.guild.id)
-        allow_ids = {tid for tid, _ in allow}
-        if message.author.id in allow_ids:
-            return
-        author_role_ids = {r.id for r in getattr(message.author, "roles", [])}
-        if author_role_ids & allow_ids:
-            return
         try:
-            verdict = await bot.moderation.review_message(message, cfg.mod_threshold)
+            cfg, result = await core.mod_flow.review(
+                guild_id=message.guild.id,
+                channel_id=message.channel.id,
+                author_id=message.author.id,
+                role_ids=[r.id for r in getattr(message.author, "roles", [])],
+                content=message.content,
+                mention_count=len(message.mentions),
+            )
         except Exception:  # noqa: BLE001 - a moderation hiccup must not crash on_message
             log.exception("Moderation review failed")
             return
-        if verdict is None:
+        if result is None or not result.report:
             return
         mod_channel = message.guild.get_channel(cfg.mod_channel_id)
         if mod_channel is None:
             return
         try:
             await mod_channel.send(
-                embed=bot.moderation.build_advisory_embed(message, verdict)
+                embed=core.moderation.build_advisory_embed(message, result.verdict)
             )
         except discord.HTTPException:
             log.exception("Could not post moderation advisory")
@@ -710,34 +679,98 @@ def register_commands(bot: DiscordAIBot) -> None:
         log.info("In %d guild(s)", len(bot.guilds))
 
 
-async def _collect_documents(channel: discord.TextChannel):
+def build_help_embed(offline: bool = False) -> discord.Embed:
+    embed = discord.Embed(
+        title="discord-ai-bot",
+        description="AI chat, summaries, vision and docs — on free NVIDIA NIM.",
+        colour=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Everyone",
+        value=(
+            "`/ask` — chat with per-channel memory\n"
+            "`/summarize` — bullet-summary of recent messages\n"
+            "`/image` — ask about an uploaded image\n"
+            "`/docs ask` — answer from the server's ingested docs\n"
+            "`/docs status` — how many doc chunks are indexed\n"
+            "`/help` — this message"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Right-click a message → Apps",
+        value=(
+            f"**{ASK_ABOUT_MENU}** — explain or answer it (describes its image, if any)\n"
+            f"**{SUMMARIZE_FROM_MENU}** — summarize the conversation from there on"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Moderators (Manage Server)",
+        value=(
+            "`/persona` — switch the bot's persona\n"
+            "`/model` — view or set the chat model\n"
+            "`/forget` — wipe this channel's memory (Manage Messages)\n"
+            "`/docs ingest` — index the docs channel\n"
+            "`/stats` — usage per command and top users\n"
+            "`/config …` — mod channel, docs channel, moderation, wipe"
+        ),
+        inline=False,
+    )
+    footer = "Moderation is assist-only: the bot suggests, humans decide."
+    if offline:
+        footer += " Offline backend active: answers are extractive, not generated."
+    embed.set_footer(text=footer)
+    return embed
+
+
+def build_stats_embed(stats: UsageStats, indexed_chunks: int) -> discord.Embed:
+    blocks = stats_lines(stats)
+    embed = discord.Embed(
+        title="Usage for this server",
+        description=blocks["total"],
+        colour=discord.Color.blurple(),
+    )
+    embed.add_field(name="Per command", value=blocks["commands"][:1024], inline=False)
+    embed.add_field(name="Top users", value=blocks["users"][:1024], inline=False)
+    embed.add_field(name="Memory", value=blocks["memory"], inline=True)
+    embed.add_field(name="Indexed doc chunks", value=str(indexed_chunks), inline=True)
+    embed.set_footer(text="Counts every accepted command. /config wipe resets them.")
+    return embed
+
+
+def _transcript_line(msg: discord.Message) -> Optional[str]:
+    """``"Name: text"`` for a human message with text, else None."""
+    if msg.author.bot:
+        return None
+    body = (msg.clean_content or "").strip()
+    return f"{msg.author.display_name}: {body}" if body else None
+
+
+async def collect_documents(channel) -> List[Tuple[str, str]]:
     """Gather (source_label, text) tuples from a docs channel.
 
     Reads every pinned message (its text and any .txt/.md/.pdf attachments) plus
     document attachments found in the channel's recent history.
     """
-    documents = []
+    documents: List[Tuple[str, str]] = []
     seen_attachment_ids = set()
 
     async def add_attachment(att: discord.Attachment, label_prefix: str) -> None:
-        if att.id in seen_attachment_ids:
+        if att.id in seen_attachment_ids or not is_document(att.filename):
             return
         seen_attachment_ids.add(att.id)
-        name = att.filename.lower()
-        text = ""
-        if name.endswith(TEXT_EXTS):
-            data = await att.read()
-            text = data.decode("utf-8", errors="replace")
-        elif name.endswith(".pdf"):
-            data = await att.read()
-            text = extract_pdf_text(data)
+        text = await document_text(att.filename, await att.read())
         if text.strip():
             documents.append((f"{label_prefix}{att.filename}", text))
 
+    # ``await channel.pins()`` is deprecated and stops at 50; iterate them all.
+    pins = []
     try:
-        pins = await channel.pins()
+        async for msg in channel.pins(limit=None):
+            pins.append(msg)
     except discord.HTTPException:
-        pins = []
+        log.warning("Could not read pins in #%s", getattr(channel, "name", "?"))
     for msg in pins:
         if msg.content.strip():
             documents.append(
@@ -756,22 +789,33 @@ async def _collect_documents(channel: discord.TextChannel):
     return documents
 
 
+# Backwards-compatible name from 1.0.
+_collect_documents = collect_documents
+
+
 # --------------------------------------------------------------------- main()
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+    load_env_file()  # <repo>/.env only; never a parent directory's .env
     settings = load_settings()
 
     if not settings.discord_token:
         print(
             "DISCORD_BOT_TOKEN is not set.\n"
             "Create a bot at https://discord.com/developers/applications, then copy "
-            "its token into your .env file. See docs/setup.md for the walkthrough."
+            "its token into your .env file. See docs/setup.md for the walkthrough.\n"
+            "To try the bot without Discord at all: python -m bot.cli --help"
         )
         sys.exit(1)
-    if not settings.has_nim_key():
+    if settings.offline:
+        log.warning(
+            "BOT_OFFLINE is set: running on the deterministic offline backend. "
+            "No NVIDIA NIM calls will be made."
+        )
+    elif not settings.has_nim_key():
         print("NVIDIA_API_KEY is not set (or is still the placeholder).\n" + SIGNUP_HINT)
         sys.exit(1)
 

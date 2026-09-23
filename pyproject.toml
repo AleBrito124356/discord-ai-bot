@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discord-ai-bot"
+dynamic = ["version"]
+description = "A complete Discord AI bot on discord.py: chat with per-channel memory, cited RAG over server docs, vision and assist-only moderation. Runs on free NVIDIA NIM, or fully offline."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Alejandro Brito" }]
+requires-python = ">=3.10"
+# Keep in sync with requirements.txt (which Docker and plain pip use).
+dependencies = [
+    "discord.py>=2.6.0",
+    "openai>=1.30.0",
+    "aiosqlite>=0.20.0",
+    "numpy>=1.26.0",
+    "python-dotenv>=1.0.0",
+    "pypdf>=4.2.0",
+    "Pillow>=10.3.0",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Framework :: AsyncIO",
+    "Topic :: Communications :: Chat",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0"]
+
+[project.scripts]
+discord-ai-bot = "bot.main:main"
+discord-ai-bot-sim = "bot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/AleBrito124356/discord-ai-bot"
+
+[tool.setuptools]
+packages = ["bot"]
+
+[tool.setuptools.dynamic]
+version = { attr = "bot.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # Any use of the deprecated ``await channel.pins()`` must fail loudly.
+    "error:.*pins.*:DeprecationWarning",
+    # discord.py itself still calls asyncio.iscoroutinefunction on Python 3.14.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+]
