@@ -373,7 +373,7 @@ pip install -r requirements-dev.txt      # or: pip install -e ".[dev]"
 pytest
 ```
 
-157 tests, fully offline (no token, no key, no network), in about 15 seconds.
+157 tests, fully offline (no token, no key, no network), in well under 30 seconds (about 13-20 s here).
 They cover persistence and the v1 → v2 migration, the RAG store's integrity
 checks, the NIM client against a mock HTTP transport (retries, error mapping,
 payloads), moderation parsing, image normalisation, the offline backend, the CLI,
